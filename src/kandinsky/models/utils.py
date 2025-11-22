@@ -3,7 +3,11 @@ import math
 import torch
 
 from torch import Tensor, IntTensor, BoolTensor
-from torch.nn.attention.flex_attention import BlockMask, _mask_mod_signature
+try:
+    from torch.nn.attention.flex_attention import BlockMask, _mask_mod_signature
+except ImportError:
+    BlockMask = None
+    _mask_mod_signature = None
 
 from einops import rearrange
 

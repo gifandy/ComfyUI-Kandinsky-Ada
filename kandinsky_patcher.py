@@ -6,6 +6,7 @@ import comfy.model_management as model_management
 import comfy.utils
 
 from .src.kandinsky.models.dit import DiffusionTransformer3D
+from .src.kandinsky.models import attention
 from .src.kandinsky.fp8_utils import convert_fp8_linear, convert_fp8_linear_on_the_fly
 from .ops import GGMLOps
 from .dequant import is_quantized
@@ -246,8 +247,12 @@ class KandinskyPatcher(comfy.model_patcher.ModelPatcher):
         if use_gguf:
             if hasattr(torch, '_dynamo'):
                 torch._dynamo.config.suppress_errors = True
+                torch._dynamo.config.force_parameter_static_shapes = False
                 # Mark model as not compilable
                 model._is_gguf = True
+            
+            # Disable compile globally for this run
+            attention.DISABLE_COMPILE = True
 
         if use_fp8 and not use_gguf:
             fp8_start = time.time()

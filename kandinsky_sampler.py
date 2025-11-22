@@ -139,13 +139,16 @@ class WrappedPreviewer:
 
         Thread(
             target=self.process_previews,
-            args=(x0, self.c_index, num_images),
+            args=(x0, self.c_index, num_images, serv.last_node_id),
         ).start()
 
         self.c_index = (self.c_index + num_previews) % num_images
         return None
 
-    def process_previews(self, image_tensor, ind, leng):
+    def process_previews(self, image_tensor, ind, leng, node_id):
+        if node_id is None:
+            return
+
         max_size = 256
 
         image_tensor = self.decode_latent_to_preview(image_tensor)
@@ -171,7 +174,7 @@ class WrappedPreviewer:
             message = pyio.BytesIO()
             message.write((1).to_bytes(length=4, byteorder="big") * 2)
             message.write(ind.to_bytes(length=4, byteorder="big"))
-            message.write(struct.pack("16p", serv.last_node_id.encode("ascii")))
+            message.write(struct.pack("16p", node_id.encode("ascii")))
             img.save(message, format="JPEG", quality=95, compress_level=1)
             serv.send_sync(server.BinaryEventTypes.PREVIEW_IMAGE, message.getvalue(), serv.client_id)
             ind = (ind + 1) % leng
@@ -202,7 +205,7 @@ def get_kandinsky_video_previewer():
 
 
 @torch.no_grad()
-def get_sparse_params(conf, batch_shape, device):
+def get_sparse_params(conf, batch_shape, device, attention_mode):
     F_cond, H_cond, W_cond, C_cond = batch_shape
     patch_size = conf.model.dit_params.patch_size
 
@@ -210,20 +213,27 @@ def get_sparse_params(conf, batch_shape, device):
     H = H_cond // patch_size[1]
     W = W_cond // patch_size[2]
 
-    if conf.model.attention.type == "nabla":
-        sta_mask = fast_sta_nabla(T, H // 8, W // 8, conf.model.attention.wT,
-                                  conf.model.attention.wH, conf.model.attention.wW, device=device)
+    if attention_mode == "nabla":
+        # Use defaults if not in config
+        wT = getattr(conf.model.attention, "wT", 11) if hasattr(conf.model, "attention") else 11
+        wH = getattr(conf.model.attention, "wH", 3) if hasattr(conf.model, "attention") else 3
+        wW = getattr(conf.model.attention, "wW", 3) if hasattr(conf.model, "attention") else 3
+        P = getattr(conf.model.attention, "P", 0.8) if hasattr(conf.model, "attention") else 0.8
+        add_sta = getattr(conf.model.attention, "add_sta", True) if hasattr(conf.model, "attention") else True
+        method = getattr(conf.model.attention, "method", "topcdf") if hasattr(conf.model, "attention") else "topcdf"
+
+        sta_mask = fast_sta_nabla(T, H // 8, W // 8, wT, wH, wW, device=device)
         sparse_params = {
             "sta_mask": sta_mask.unsqueeze_(0).unsqueeze_(0),
-            "attention_type": conf.model.attention.type,
+            "attention_type": "nabla",
             "to_fractal": True,
-            "P": conf.model.attention.P,
-            "wT": conf.model.attention.wT,
-            "wW": conf.model.attention.wW,
-            "wH": conf.model.attention.wH,
-            "add_sta": conf.model.attention.add_sta,
+            "P": P,
+            "wT": wT,
+            "wW": wW,
+            "wH": wH,
+            "add_sta": add_sta,
             "visual_shape": (T, H, W),
-            "method": getattr(conf.model.attention, "method", "topcdf"),
+            "method": method,
         }
     else:
         sparse_params = None
@@ -233,7 +243,7 @@ def get_sparse_params(conf, batch_shape, device):
 @torch.no_grad()
 def get_velocity(
     dit,
-    model_input,
+    x,
     t,
     text_embeds,
     null_text_embeds,
@@ -243,35 +253,41 @@ def get_velocity(
     guidance_weight,
     conf,
     sparse_params=None,
+    attention_mask=None,
+    null_attention_mask=None,
 ):
-    pred_velocity = dit(
-        model_input,
-        text_embeds["text_embeds"],
-        text_embeds["pooled_embed"],
-        t * 1000,
-        visual_rope_pos,
-        text_rope_pos,
-        scale_factor=conf.metrics.scale_factor,
-        sparse_params=sparse_params,
-        attention_mask=text_embeds["attention_mask"],
-    )
-
-    if abs(guidance_weight - 1.0) > 1e-6:
-        uncond_pred_velocity = dit(
-            model_input,
-            null_text_embeds["text_embeds"],
-            null_text_embeds["pooled_embed"],
-            t * 1000,
-            visual_rope_pos,
-            null_text_rope_pos,
-            scale_factor=conf.metrics.scale_factor,
-            sparse_params=sparse_params,
-            attention_mask=null_text_embeds["attention_mask"],
-        )
-        pred_velocity = pred_velocity.float()
-        uncond_pred_velocity = uncond_pred_velocity.float()
-        pred_velocity = uncond_pred_velocity + guidance_weight * (pred_velocity - uncond_pred_velocity)
-
+    with torch._dynamo.utils.disable_cache_limit():
+        if abs(guidance_weight - 1.0) > 1e-6:
+            pred_velocity, uncond_pred_velocity = dit(
+                x,
+                text_embeds["text_embeds"],
+                text_embeds["pooled_embed"],
+                t * 1000,
+                visual_rope_pos,
+                text_rope_pos,
+                scale_factor=conf.metrics.scale_factor,
+                sparse_params=sparse_params,
+                attention_mask=attention_mask,
+                x_uncond=x,
+                text_embed_uncond=null_text_embeds["text_embeds"],
+                pooled_text_embed_uncond=null_text_embeds["pooled_embed"],
+                time_uncond=t * 1000,
+            )
+            pred_velocity = uncond_pred_velocity + guidance_weight * (
+                pred_velocity - uncond_pred_velocity
+            )
+        else:
+            pred_velocity = dit(
+                x,
+                text_embeds["text_embeds"],
+                text_embeds["pooled_embed"],
+                t * 1000,
+                visual_rope_pos,
+                text_rope_pos,
+                scale_factor=conf.metrics.scale_factor,
+                sparse_params=sparse_params,
+                attention_mask=attention_mask,
+            )
     return pred_velocity
 
 @torch.no_grad()
@@ -295,6 +311,7 @@ def generate(
     global_step_offset=0,
     total_steps=None,
     video_previewer=None,
+    attention_mode="sdpa",
 ):
 
     g = torch.Generator(device=device)
@@ -306,7 +323,7 @@ def generate(
     if torch.isnan(current_latent).any() or torch.isinf(current_latent).any():
         current_latent = torch.randn(shape, device=device, dtype=torch.float32)
 
-    sparse_params = get_sparse_params(conf, shape, device)
+    sparse_params = get_sparse_params(conf, shape, device, attention_mode)
 
     timesteps = torch.linspace(1.0, 0.0, steps + 1, device=device, dtype=torch.float32)
     timesteps = scheduler_scale * timesteps / (1 + (scheduler_scale - 1) * timesteps)
@@ -389,7 +406,7 @@ class KandinskySampler(io.ComfyNode):
                 io.Int.Input("steps", default=50, min=1, max=200, tooltip="50, 16 for distilled version."),
                 io.Float.Input("cfg", default=5.0, min=1.0, max=20.0, step=0.1, tooltip="1.0 for distilled and nocfg, 5.0 for others."),
                 io.Float.Input("scheduler_scale", default=10.0, min=1.0, max=20.0, step=0.1, tooltip="10.0 for 5s, 5.0 for 10s."),
-                io.Boolean.Input("use_sage_attention", default=False, tooltip="Enable SageAttention for faster inference with lower memory usage."),
+                io.Combo.Input("attention_mode", options=["sdpa", "sage", "nabla"], default="sdpa", tooltip="'nabla' is only for 20B models, gives a big boost to speed."),
                 io.Conditioning.Input("positive", tooltip="Positive conditioning from Kandinsky 5 Text Encode."),
                 io.Conditioning.Input("negative", tooltip="Negative conditioning from Kandinsky 5 Text Encode."),
                 io.Latent.Input("latent_image", tooltip="Empty latent from Empty Kandinsky 5 Latent."),
@@ -399,9 +416,9 @@ class KandinskySampler(io.ComfyNode):
 
     @classmethod
     @torch.no_grad()
-    def execute(cls, model, seed, steps, cfg, scheduler_scale, use_sage_attention, positive, negative, latent_image) -> io.NodeOutput:
+    def execute(cls, model, seed, steps, cfg, scheduler_scale, attention_mode, positive, negative, latent_image) -> io.NodeOutput:
         patcher = model
-        set_sage_attention(use_sage_attention)
+        set_sage_attention(attention_mode == "sage")
 
         comfy.model_management.load_model_gpu(patcher)
         k_handler = patcher.model
@@ -504,6 +521,7 @@ class KandinskySampler(io.ComfyNode):
                     global_step_offset=i * steps,
                     total_steps=total_steps,
                     video_previewer=video_previewer,
+                    attention_mode=attention_mode,
                 )
                 output_latents.append(final_latent_unbatched.permute(3, 0, 1, 2))
 

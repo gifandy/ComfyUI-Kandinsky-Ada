@@ -3,13 +3,16 @@ import math
 import torch
 from torch import nn
 import torch.nn.functional as F
-from torch.nn.attention.flex_attention import flex_attention
+try:
+    from torch.nn.attention.flex_attention import flex_attention
+except ImportError:
+    flex_attention = None
 
 from .utils import get_freqs, nablaT_v2
 from . import attention
 from .attention import SelfAttentionEngine
 
-def safe_compile(mode=None, dynamic=False):
+def safe_compile(mode=None, dynamic=False, force=False):
     def decorator(fn):
         compiled_fn = fn
         try:
@@ -21,7 +24,7 @@ def safe_compile(mode=None, dynamic=False):
             compiled_fn = fn
 
         def runtime_wrapper(*args, **kwargs):
-            if hasattr(attention, 'DISABLE_COMPILE') and attention.DISABLE_COMPILE:
+            if not force and hasattr(attention, 'DISABLE_COMPILE') and attention.DISABLE_COMPILE:
                 return fn(*args, **kwargs)
             else:
                 return compiled_fn(*args, **kwargs)
@@ -275,7 +278,7 @@ class MultiheadSelfAttentionDec(nn.Module):
             v=value.unsqueeze(0))[0].flatten(-2, -1)
         return out
 
-    @safe_compile(mode="max-autotune-no-cudagraphs", dynamic=True)
+    @safe_compile(mode="max-autotune-no-cudagraphs", dynamic=True, force=True)
     def nabla(self, query, key, value, sparse_params=None):
         query = query.unsqueeze(0).transpose(1, 2).contiguous()
         key = key.unsqueeze(0).transpose(1, 2).contiguous()

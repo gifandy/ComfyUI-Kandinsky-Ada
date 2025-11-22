@@ -1,6 +1,9 @@
 import torch
 import torch.nn.functional as F
-from torch.nn.attention.flex_attention import flex_attention
+try:
+    from torch.nn.attention.flex_attention import flex_attention
+except ImportError:
+    flex_attention = None
 
 USE_SAGE_ATTENTION = False
 DISABLE_COMPILE = False  # Disable torch.compile when using sage attention

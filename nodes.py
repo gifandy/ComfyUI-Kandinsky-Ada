@@ -234,12 +234,13 @@ class KandinskyImageToVideoLatent(io.ComfyNode):
                 io.Image.Input("image", tooltip="Input image to condition the video generation."),
                 io.Float.Input("time_length", default=5.0, min=0.1, max=30.0, step=0.1, tooltip="Time in seconds for the output video."),
                 io.Int.Input("batch_size", default=1, min=1, max=64),
+                io.Int.Input("alignment", default=16, min=16, max=128, step=16, tooltip="Pixel alignment for resizing. Use 128 for 20B models (NABLA attention), 16 for others."),
             ],
             outputs=[io.Latent.Output()],
         )
 
     @classmethod
-    def execute(cls, vae, image, time_length, batch_size) -> io.NodeOutput:
+    def execute(cls, vae, image, time_length, batch_size, alignment) -> io.NodeOutput:
         from math import floor, sqrt
         import comfy.model_management as mm
 
@@ -251,9 +252,9 @@ class KandinskyImageToVideoLatent(io.ComfyNode):
         MAX_AREA = 768 * 512
         B, C, H, W = image.shape
         area = H * W
-        k = sqrt(MAX_AREA / area) / 16
-        new_h = int(floor(H * k) * 16)
-        new_w = int(floor(W * k) * 16)
+        k = sqrt(MAX_AREA / area) / alignment
+        new_h = int(floor(H * k) * alignment)
+        new_w = int(floor(W * k) * alignment)
 
         if new_h != H or new_w != W:
             import torch.nn.functional as F_torch

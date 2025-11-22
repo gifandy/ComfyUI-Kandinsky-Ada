@@ -18,12 +18,22 @@ from .nn import (
 )
 from .utils import fractal_flatten, fractal_unflatten
 
+from . import attention
+
 def safe_compile():
     def decorator(fn):
+        compiled_fn = fn
         try:
-            return torch.compile()(fn)
+            compiled_fn = torch.compile()(fn)
         except (AttributeError, RuntimeError):
-            return fn
+            pass
+
+        def runtime_wrapper(*args, **kwargs):
+            if hasattr(attention, 'DISABLE_COMPILE') and attention.DISABLE_COMPILE:
+                return fn(*args, **kwargs)
+            else:
+                return compiled_fn(*args, **kwargs)
+        return runtime_wrapper
     return decorator
 
 
@@ -232,16 +242,30 @@ class DiffusionTransformer3D(nn.Module):
         text_rope_pos,
         scale_factor=(1.0, 1.0, 1.0),
         sparse_params=None,
-        attention_mask=None
+        attention_mask=None,
+        x_uncond=None,
+        text_embed_uncond=None,
+        pooled_text_embed_uncond=None,
+        time_uncond=None,
     ):
         text_embed, time_embed, text_rope, visual_embed = self.before_text_transformer_blocks(
             text_embed, time, pooled_text_embed, x, text_rope_pos)
 
+        if x_uncond is not None:
+            text_embed_uncond, time_embed_uncond, _, visual_embed_uncond = self.before_text_transformer_blocks(
+                text_embed_uncond, time_uncond, pooled_text_embed_uncond, x_uncond, text_rope_pos)
+
         for text_transformer_block in self.text_transformer_blocks:
             text_embed = text_transformer_block(text_embed, time_embed, text_rope, attention_mask)
+            if x_uncond is not None:
+                text_embed_uncond = text_transformer_block(text_embed_uncond, time_embed_uncond, text_rope, attention_mask)
 
         visual_embed, visual_shape, to_fractal, visual_rope = self.before_visual_transformer_blocks(
             visual_embed, visual_rope_pos, scale_factor, sparse_params)
+
+        if x_uncond is not None:
+            visual_embed_uncond, _, _, _ = self.before_visual_transformer_blocks(
+                visual_embed_uncond, visual_rope_pos, scale_factor, sparse_params)
 
         if self.block_swap_enabled:
             device = visual_embed.device
@@ -264,6 +288,9 @@ class DiffusionTransformer3D(nn.Module):
                 if i in self.pinned_blocks:
                     visual_embed = visual_transformer_block(visual_embed, text_embed, time_embed,
                                                             visual_rope, sparse_params, attention_mask)
+                    if x_uncond is not None:
+                        visual_embed_uncond = visual_transformer_block(visual_embed_uncond, text_embed_uncond, time_embed_uncond,
+                                                                    visual_rope, sparse_params, attention_mask)
                     continue
 
                 while len(currently_loaded_blocks) >= self.blocks_in_memory:
@@ -309,6 +336,10 @@ class DiffusionTransformer3D(nn.Module):
 
                 visual_embed = visual_transformer_block(visual_embed, text_embed, time_embed,
                                                         visual_rope, sparse_params, attention_mask)
+                if x_uncond is not None:
+                    visual_embed_uncond = visual_transformer_block(visual_embed_uncond, text_embed_uncond, time_embed_uncond,
+                                                                visual_rope, sparse_params, attention_mask)
+
                 next_idx = i + 1
                 if (next_idx < self.num_visual_blocks and
                     next_idx not in self.pinned_blocks and
@@ -331,8 +362,16 @@ class DiffusionTransformer3D(nn.Module):
             for visual_transformer_block in self.visual_transformer_blocks:
                 visual_embed = visual_transformer_block(visual_embed, text_embed, time_embed,
                                                         visual_rope, sparse_params, attention_mask)
+                if x_uncond is not None:
+                    visual_embed_uncond = visual_transformer_block(visual_embed_uncond, text_embed_uncond, time_embed_uncond,
+                                                                visual_rope, sparse_params, attention_mask)
 
         x = self.after_blocks(visual_embed, visual_shape, to_fractal, text_embed, time_embed)
+        
+        if x_uncond is not None:
+            x_uncond = self.after_blocks(visual_embed_uncond, visual_shape, to_fractal, text_embed_uncond, time_embed_uncond)
+            return x, x_uncond
+            
         return x
 
 
