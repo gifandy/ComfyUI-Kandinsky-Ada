@@ -1,0 +1,4 @@
+tqdm
+omegaconf
+gguf
+einops
