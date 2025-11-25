@@ -3,10 +3,14 @@ import folder_paths
 import comfy.model_patcher
 import comfy.model_management
 import comfy.utils
+import math
+import torch.nn.functional as F_torch
 from omegaconf import OmegaConf
 from typing_extensions import override
 from comfy_api.latest import io
 import os
+import numpy as np # Hinzugefügt für detail_pass
+import cv2 # Hinzugefügt für detail_pass
 
 from .kandinsky_patcher import KandinskyModelHandler, KandinskyPatcher
 from .src.kandinsky.magcache_utils import set_magcache_params
@@ -17,6 +21,8 @@ try:
 except ImportError:
     Qwen2_5_VLForConditionalGeneration = None
     AutoProcessor = None
+
+
 
 class KandinskyQwenWrapper:
     def __init__(self, model, processor, device):
@@ -515,6 +521,116 @@ class KandinskyVAELoader(io.ComfyNode):
         return io.NodeOutput(VAEWrapper(vae))
 
 
+
+
+
+#-----------------
+
+class KandinskyVAEDecodeGPT(io.ComfyNode):
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="KandinskyV5_VAEDecode",
+            category="Kandinsky",
+            description="Decodes Kandinsky-5 5D video latents to frames using the VAE's built-in tiling.",
+            inputs=[
+                io.Vae.Input("vae", tooltip="The Kandinsky VAE from the VAE Loader."),
+                io.Latent.Input("samples", tooltip="Latent samples from Kandinsky 5 Sampler."),
+                io.Boolean.Input("enable_tiling", default=True, tooltip="Enable tiling to reduce VRAM usage."),
+                io.Int.Input("tile_min_frames", default=16, min=1, max=64),
+                io.Int.Input("tile_min_height", default=256, min=64, max=1024, step=64),
+                io.Int.Input("tile_min_width", default=256, min=64, max=1024, step=64),
+            ],
+            outputs=[io.Image.Output()],
+        )
+
+    @classmethod
+    def execute(cls, vae, samples, enable_tiling, tile_min_frames, tile_min_height, tile_min_width) -> io.NodeOutput:
+        import comfy.model_management as mm
+        import math
+
+        device = mm.get_torch_device()
+        offload_device = mm.unet_offload_device()
+
+        latent = samples["samples"]
+        B, C, F, H, W = latent.shape  # ORIGINAL latent shape preserved
+
+        latent = latent.to(device)
+        latent = latent / 0.476986  # scaling factor
+
+        vae_model = vae.first_stage_model.to(device)
+        vae_dtype = next(vae_model.parameters()).dtype
+        latent = latent.to(vae_dtype)
+
+        has_tiling = hasattr(vae_model, 'use_tiling')
+
+        # Fix: disable tiling if latent is smaller than tile
+        if enable_tiling and (F < tile_min_frames or H < tile_min_height or W < tile_min_width):
+            enable_tiling = False
+
+        if enable_tiling and has_tiling:
+            # Save original settings
+            original = {
+                "use_tiling": vae_model.use_tiling,
+                "use_framewise": vae_model.use_framewise_decoding,
+                "min_f": vae_model.tile_sample_min_num_frames,
+                "min_h": vae_model.tile_sample_min_height,
+                "min_w": vae_model.tile_sample_min_width,
+            }
+
+            vae_model.use_tiling = True
+            vae_model.use_framewise_decoding = True
+
+            # Set tile sizes
+            vae_model.tile_sample_min_num_frames = tile_min_frames
+            vae_model.tile_sample_min_height = tile_min_height
+            vae_model.tile_sample_min_width = tile_min_width
+
+            # 🔥 FIX: Strides MUST divide latent dims → use gcd
+            vae_model.tile_sample_stride_num_frames = math.gcd(F, tile_min_frames)
+            vae_model.tile_sample_stride_height  = math.gcd(H, tile_min_height)
+            vae_model.tile_sample_stride_width   = math.gcd(W, tile_min_width)
+
+        else:
+            original = None
+            if has_tiling:
+                vae_model.use_tiling = False
+                vae_model.use_framewise_decoding = False
+
+        # Decode
+        with torch.no_grad():
+            autocast_dtype = torch.bfloat16 if vae_dtype == torch.bfloat16 else torch.float16
+            with torch.autocast(device_type=device.type, dtype=autocast_dtype, enabled=(vae_dtype != torch.float32)):
+                
+                decoded = vae_model.decode(latent, return_dict=False)[0]
+
+                # DO NOT overwrite original H/W from latent.
+                _, _, Fd, Hd, Wd = decoded.shape
+
+                # Convert to (frames, H, W, C)
+                decoded = decoded.permute(0, 2, 3, 4, 1)
+                decoded = decoded.reshape(B * Fd, Hd, Wd, C)
+
+                decoded = (decoded + 1.0) / 2.0
+                decoded = decoded.clamp(0.0, 1.0)
+
+        # Restore tiling settings
+        if enable_tiling and has_tiling and original is not None:
+            vae_model.use_tiling = original["use_tiling"]
+            vae_model.use_framewise_decoding = original["use_framewise"]
+            vae_model.tile_sample_min_num_frames = original["min_f"]
+            vae_model.tile_sample_min_height = original["min_h"]
+            vae_model.tile_sample_min_width = original["min_w"]
+
+        try:
+            vae_model.to(offload_device)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except:
+            pass
+
+        return io.NodeOutput(decoded.cpu().float())
+
 class KandinskyVAEDecode(io.ComfyNode):
     @classmethod
     def define_schema(cls) -> io.Schema:
@@ -618,3 +734,308 @@ class KandinskyVAEDecode(io.ComfyNode):
         decoded = decoded.cpu().float()
 
         return io.NodeOutput(decoded)
+
+##### --------------
+
+
+class KandinskyHQVAEDecode(io.ComfyNode):
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="KandinskyHQVAEDecode",
+            category="Kandinsky",
+            description=(
+                "HQ Kandinsky-5 Video VAE Decode (V25 GPU Vektorisierung): "
+                "Basierend auf V24, aber ohne Python-Schleifen pro Frame. "
+                "Komplett GPU-beschleunigtes Tiling, Weight-Accumulation und Anti-Flicker."
+            ),
+            inputs=[
+                io.Vae.Input("vae"),
+                io.Latent.Input("samples"),
+
+                io.Boolean.Input("enable_tiling", default=True),
+
+                io.Int.Input("tile_min_height", default=64, min=32, max=1024, step=32),
+                io.Int.Input("tile_min_width",  default=64, min=32, max=1024, step=32),
+
+                io.Float.Input("overlap_ratio", default=0.50, min=0.10, max=0.90, step=0.05),
+
+                io.Boolean.Input("hq_blend", default=True),
+                io.Boolean.Input("auto_fade", default=True),
+                io.Float.Input("manual_fade_ratio", default=0.04, min=0.0, max=0.5, step=0.01),
+
+                io.Boolean.Input("anti_flicker", default=True),
+                io.Float.Input("low_diff_threshold",  default=0.01, min=0.0001, max=0.2,  step=0.005),
+                io.Float.Input("high_diff_threshold", default=0.05, min=0.001,  max=0.5,  step=0.005),
+
+                io.Boolean.Input("detail_pass", default=False),
+            ],
+            outputs=[io.Image.Output()],
+        )
+
+    # -------------------- Hilfsfunktionen --------------------
+
+    @staticmethod
+    def _make_starts(dim_lat: int, tile_lat: int, stride_lat: int):
+        starts = []
+        pos = 0
+        while pos + tile_lat < dim_lat:
+            starts.append(pos)
+            pos += stride_lat
+        starts.append(dim_lat - tile_lat)
+        return sorted(set(starts))
+
+    @staticmethod
+    def auto_fade_px(tile_pix: int, overlap_ratio: float) -> int:
+        tile_pix      = max(16, min(2048, tile_pix))
+        overlap_ratio = max(0.10, min(0.90, float(overlap_ratio)))
+        fade          = int(tile_pix * overlap_ratio * 0.5)
+        fade          = max(2, min(fade, tile_pix // 2))
+        return fade
+
+    @staticmethod
+    def _make_pixel_window(size_pix: int, fade_px: int, device: torch.device):
+        win = torch.ones(size_pix, dtype=torch.float32, device=device)
+        if fade_px <= 0:
+            return win, 0
+        fade  = max(1, min(fade_px, size_pix // 2))
+        ramp  = torch.linspace(0.0, 1.0, fade, device=device)
+        shape = 0.5 * (1.0 - torch.cos(math.pi * ramp))
+        win[:fade]  = shape
+        win[-fade:] = shape.flip(0)
+        return win, fade
+
+    @staticmethod
+    def _anti_flicker_gpu(final: torch.Tensor,
+                          B: int,
+                          F: int,
+                          low: float,
+                          high: float) -> torch.Tensor:
+        """
+        final: (B*F, H, W, 3) auf GPU.
+        Zeitliche Glättung pro Batch b & Frame t in Torch.
+        """
+        low  = max(1e-6, float(low))
+        high = max(low + 1e-6, float(high))
+
+        BxF, H, W, C = final.shape
+        final = final.view(B, F, H, W, C)
+
+        with torch.no_grad():
+            for b in range(B):
+                prev = final[b, 0]
+                for t in range(1, F):
+                    cur = final[b, t]
+                    diff = torch.mean(torch.abs(cur - prev))
+
+                    blend = (diff - low) / (high - low)
+                    blend = torch.clamp(blend, 0.0, 1.0)
+
+                    smooth = blend * cur + (1.0 - blend) * prev
+                    final[b, t] = smooth
+                    prev = smooth
+
+        return final.view(BxF, H, W, C)
+
+    @staticmethod
+    def _detail_pass_cpu(final: torch.Tensor) -> torch.Tensor:
+        """
+        Einfacher Schärfepass auf CPU, wie gehabt.
+        final: (N, H, W, 3), Werte 0..1
+        """
+        import numpy as np
+        import cv2
+
+        arr = (final.cpu().numpy() * 255.0).astype("uint8")
+        for i in range(arr.shape[0]):
+            im    = arr[i]
+            blur  = cv2.GaussianBlur(im, (0, 0), 1.0)
+            sharp = cv2.addWeighted(im, 1.05, blur, -0.05, 0)
+            arr[i] = np.clip(sharp, 0, 255)
+        return torch.from_numpy(arr.astype("float32") / 255.0)
+
+    # -------------------- Hauptfunktion --------------------
+
+    @classmethod
+    def execute(
+        cls,
+        vae, samples,
+        enable_tiling,
+        tile_min_height, tile_min_width,
+        overlap_ratio,
+        hq_blend,
+        auto_fade,
+        manual_fade_ratio,
+        anti_flicker,
+        low_diff_threshold,
+        high_diff_threshold,
+        detail_pass,
+    ) -> io.NodeOutput:
+
+        import comfy.model_management as mm
+
+        latent = samples["samples"]  # (B,C,F,H_lat,W_lat)
+        if not isinstance(latent, torch.Tensor) or latent.ndim != 5:
+            raise RuntimeError("KandinskyHQVAEDecodeV25 erwartet Latent (B,C,F,H,W).")
+
+        B, C, F_lat, H_lat, W_lat = latent.shape
+
+        device = mm.get_torch_device()
+        latent = latent.to(device) / 0.476986
+
+        vae_model = vae.first_stage_model.to(device)
+        vae_dtype = next(vae_model.parameters()).dtype
+        latent = latent.to(vae_dtype)
+
+        # Kandinsky 5: räumlicher Upscale-Faktor
+        VAE_S = 8
+        H_pix_total = H_lat * VAE_S
+        W_pix_total = W_lat * VAE_S
+
+        # --- Kein Tiling: Full Decode ---
+        if not enable_tiling:
+            with torch.no_grad():
+                acdtype = torch.float16 if vae_dtype != torch.float32 else torch.float32
+                with torch.autocast(device_type=device.type, dtype=acdtype, enabled=(vae_dtype != torch.float32)):
+                    dec = vae_model.decode(latent, return_dict=False)[0]  # (B,C,F,H,W)
+
+            B_d, C_d, F_d, H_d, W_d = dec.shape
+            img = dec.permute(0, 2, 3, 4, 1).reshape(B_d * F_d, H_d, W_d, C_d)
+            final = ((img + 1.0) / 2.0).clamp(0.0, 1.0)
+
+            if anti_flicker and F_d > 1:
+                final = cls._anti_flicker_gpu(final, B_d, F_d, low_diff_threshold, high_diff_threshold)
+
+            if detail_pass:
+                final = cls._detail_pass_cpu(final)
+
+            return io.NodeOutput(final.cpu().float())
+
+        # --- Tilegrößen im Latentraum ---
+        tile_h_lat = max(1, min(H_lat, tile_min_height // VAE_S))
+        tile_w_lat = max(1, min(W_lat, tile_min_width  // VAE_S))
+
+        # Wenn Tile >= gesamter Latent → einfach Full Decode, aber mit Anti-Flicker
+        if H_lat <= tile_h_lat and W_lat <= tile_w_lat:
+            return cls.execute(
+                vae, samples,
+                False,
+                tile_min_height, tile_min_width,
+                overlap_ratio,
+                hq_blend,
+                auto_fade,
+                manual_fade_ratio,
+                anti_flicker,
+                low_diff_threshold,
+                high_diff_threshold,
+                detail_pass,
+            )
+
+        # --- Overlap & Stride ---
+        overlap_ratio = float(max(0.10, min(0.90, overlap_ratio)))
+        stride_h_lat  = max(1, int(tile_h_lat * (1.0 - overlap_ratio)))
+        stride_w_lat  = max(1, int(tile_w_lat * (1.0 - overlap_ratio)))
+        if stride_h_lat >= tile_h_lat and tile_h_lat > 1:
+            stride_h_lat = tile_h_lat - 1
+        if stride_w_lat >= tile_w_lat and tile_w_lat > 1:
+            stride_w_lat = tile_w_lat - 1
+
+        h_starts = cls._make_starts(H_lat, tile_h_lat, stride_h_lat)
+        w_starts = cls._make_starts(W_lat, tile_w_lat, stride_w_lat)
+
+        total_tiles = len(h_starts) * len(w_starts)
+        pbar = comfy.utils.ProgressBar(total_tiles)
+
+        # --- Accu & Weightmap: komplett auf GPU, vektorisiert ---
+        acc  = None   # (B, F_pix, H_pix_total, W_pix_total, 3)
+        wacc = None
+
+        F_pix_total = None
+
+        with torch.no_grad():
+            acdtype = torch.float16 if vae_dtype != torch.float32 else torch.float32
+
+            with torch.autocast(device_type=device.type, dtype=acdtype, enabled=(vae_dtype != torch.float32)):
+
+                for h0 in h_starts:
+                    for w0 in w_starts:
+                        h1 = h0 + tile_h_lat
+                        w1 = w0 + tile_w_lat
+
+                        # 1) Latent-Tile (alle Frames, nur H/W geteilt)
+                        lt = latent[:, :, :, h0:h1, w0:w1]  # (B,C,F,H_tile,W_tile)
+
+                        dec = vae_model.decode(lt, return_dict=False)[0]  # (B,C,F_t,H_t,W_t)
+                        B_t, C_t, F_t, H_t, W_t = dec.shape
+
+                        if acc is None:
+                            F_pix_total = F_t  # Wir tilen nur spatial, nicht temporal
+                            acc  = torch.zeros((B_t, F_t, H_pix_total, W_pix_total, 3),
+                                               dtype=torch.float32, device=device)
+                            wacc = torch.zeros_like(acc)
+
+                        # (B,F,H,W,3)
+                        img = dec.permute(0, 2, 3, 4, 1)
+                        img = ((img + 1.0) / 2.0).clamp(0.0, 1.0)
+
+                        # 2) Window im Pixelspace
+                        if hq_blend:
+                            tile_pix = min(H_t, W_t)
+                            if auto_fade:
+                                fade_px = cls.auto_fade_px(tile_pix, overlap_ratio)
+                            else:
+                                fade_px = int(max(0.0, min(0.5, manual_fade_ratio)) * tile_pix)
+
+                            win_h, fade_h = cls._make_pixel_window(H_t, fade_px, device)
+                            win_w, fade_w = cls._make_pixel_window(W_t, fade_px, device)
+
+                            # Kantenpixel an Bildrand nicht ausblenden
+                            if h0 == 0:
+                                win_h[:fade_h] = 1.0
+                            if h1 == H_lat:
+                                win_h[-fade_h:] = 1.0
+                            if w0 == 0:
+                                win_w[:fade_w] = 1.0
+                            if w1 == W_lat:
+                                win_w[-fade_w:] = 1.0
+
+                            w_hw = torch.outer(win_h, win_w).unsqueeze(-1)  # (H_t,W_t,1)
+                        else:
+                            w_hw = torch.ones((H_t, W_t, 1), dtype=torch.float32, device=device)
+
+                        # 3) Vektorisiertes Accu-Update (keine b/f-Schleifen)
+                        h_pix0 = h0 * VAE_S
+                        w_pix0 = w0 * VAE_S
+
+                        hh = min(H_t, H_pix_total - h_pix0)
+                        ww = min(W_t, W_pix_total - w_pix0)
+
+                        if hh > 0 and ww > 0:
+                            # Formen für Broadcast:
+                            # img: (B,F,H_t,W_t,3)
+                            # w_hw: (H_t,W_t,1) -> (1,1,H_t,W_t,1)
+                            w_broadcast = w_hw[:hh, :ww, :].view(1, 1, hh, ww, 1)
+
+                            acc[:, :, h_pix0:h_pix0+hh, w_pix0:w_pix0+ww, :] += (
+                                img[:, :, :hh, :ww, :] * w_broadcast
+                            )
+                            wacc[:, :, h_pix0:h_pix0+hh, w_pix0:w_pix0+ww, :] += w_broadcast
+
+                        pbar.update(1)
+
+        # --- Normierung ---
+        wacc = torch.clamp(wacc, min=1e-6)
+        final = (acc / wacc).clamp(0.0, 1.0)  # (B,F,H,W,3)
+
+        # --- Anti-Flicker (GPU) ---
+        if anti_flicker and F_pix_total is not None and F_pix_total > 1:
+            final = final.view(B * F_pix_total, H_pix_total, W_pix_total, 3)
+            final = cls._anti_flicker_gpu(final, B, F_pix_total, low_diff_threshold, high_diff_threshold)
+        else:
+            final = final.view(B * F_pix_total, H_pix_total, W_pix_total, 3)
+
+        # --- Detail-Pass optional (CPU) ---
+        if detail_pass:
+            final = cls._detail_pass_cpu(final)
+
+        return io.NodeOutput(final.cpu().float())
